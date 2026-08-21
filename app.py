@@ -4,7 +4,7 @@ Render-ready FastAPI Web Service for DoodStream / Playmogo Extraction & ID Looku
 Endpoints:
   - GET /
   - GET /health
-  - GET /api/{query_id}          (Accepts TMDB ID e.g. 1554, IMDB ID e.g. tt0090967, TMDB/IMDB combo e.g. 1554/tt0090967, or direct Dood URL/ID)
+  - GET /api/{query_id}          (Accepts TMDB ID e.g. 81, IMDB ID e.g. tt0087544, TMDB/IMDB combo e.g. 81/tt0087544, or direct Dood URL/ID)
   - GET /api/extract?url=...     (Direct extraction by URL or Dood file code)
   - GET /api/lookup/{query_id}   (Lookup database record only without extracting)
 """
@@ -51,29 +51,25 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Config & Mirrors
+# Config & Active Fast Mirrors (Prioritized & Verified)
 # ---------------------------------------------------------------------------
 
 MIRRORS = [
+    "playmogo.com",
     "dood.watch",
-    "dood.re",
     "dood.so",
-    "dood.la",
-    "dood.pm",
-    "dood.ws",
-    "dood.wf",
-    "dood.to",
-    "dood.cx",
-    "dood.sh",
     "dood.li",
     "doods.pro",
+    "vidply.com",
     "ds2play.com",
     "ds2video.com",
+    "d-s.io",
     "d000d.com",
     "d0000d.com",
-    "d-s.io",
-    "vidply.com",
-    "playmogo.com",
+    "dood.ws",
+    "dood.pm",
+    "dood.re",
+    "dood.to",
 ]
 
 UA = (
@@ -182,8 +178,8 @@ def _make_play(token: str) -> str:
     return f"{rnd}?token={token}&expiry={int(time.time() * 1000)}"
 
 
-def _build_session(use_cloudscraper: bool):
-    if use_cloudscraper and cloudscraper is not None:
+def _build_session(engine: str):
+    if engine == "cloudscraper" and cloudscraper is not None:
         s = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
         )
@@ -196,7 +192,7 @@ def _build_session(use_cloudscraper: bool):
 def _try_mirror(session, mirror: str, vid: str) -> Optional[Tuple[str, str]]:
     url = f"https://{mirror}/e/{vid}"
     try:
-        r = session.get(url, timeout=15, allow_redirects=True)
+        r = session.get(url, timeout=(3, 5), allow_redirects=True)
     except requests.RequestException:
         return None
     if r.status_code != 200 or not r.text:
@@ -207,17 +203,22 @@ def _try_mirror(session, mirror: str, vid: str) -> Optional[Tuple[str, str]]:
 
 
 def _load_player(vid: str, mirrors: Iterable[str]) -> Tuple[Any, str, str]:
+    """
+    Tries Cloudscraper first because Cloudflare blocks standard requests on cloud hosting (like Render/AWS).
+    Falls back to requests if needed.
+    """
+    engines = ["cloudscraper", "requests"] if cloudscraper is not None else ["requests"]
     last_err = None
-    for engine in ("requests", "cloudscraper"):
-        if engine == "cloudscraper" and cloudscraper is None:
-            continue
-        session = _build_session(engine == "cloudscraper")
+
+    for engine in engines:
+        session = _build_session(engine)
         for m in mirrors:
             hit = _try_mirror(session, m, vid)
             if hit:
                 final_url, html = hit
                 return session, final_url, html
             last_err = m
+
     raise RuntimeError(
         f"No mirror served the player for id={vid!r}. Last tried: {last_err}."
     )
@@ -246,7 +247,7 @@ def extract_dood(url_or_id: str) -> dict:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Dest": "empty",
         },
-        timeout=15,
+        timeout=(3, 6),
     )
     r2.raise_for_status()
     body = r2.text.strip()
@@ -275,7 +276,7 @@ def find_in_database(query_id: str) -> Optional[dict]:
     """Finds record in JSON database using TMDB, IMDB, or Combo ID."""
     clean_id = query_id.strip().lower()
 
-    # 1. Exact combo match e.g. 1554/tt0090967
+    # 1. Exact combo match e.g. 81/tt0087544
     if clean_id in combo_index:
         return combo_index[clean_id]
 
@@ -283,7 +284,7 @@ def find_in_database(query_id: str) -> Optional[dict]:
     if clean_id in tmdb_index:
         return tmdb_index[clean_id]
 
-    # 3. IMDB ID match (e.g. tt0090967)
+    # 3. IMDB ID match (e.g. tt0087544)
     if clean_id in imdb_index:
         return imdb_index[clean_id]
 
@@ -312,11 +313,11 @@ def index():
         "service": "DoodStream API Extractor",
         "total_indexed_movies": all_items_count,
         "examples": [
-            "/api/1554",
-            "/api/tt0090967",
-            "/api/1554/tt0090967",
-            "/api/extract?url=https://dood.watch/e/wyz9kdt2rshh",
-            "/api/lookup/1554"
+            "/api/81",
+            "/api/tt0087544",
+            "/api/81/tt0087544",
+            "/api/extract?url=https://dood.watch/e/yf1wzl7rq2yv",
+            "/api/lookup/81"
         ]
     }
 
@@ -357,7 +358,7 @@ def extract_by_url(url: str = Query(..., description="Direct DoodStream or Playm
 def api_resolve(query_id: str):
     """
     Unified endpoint:
-    - If TMDB/IMDB ID is passed (e.g., 1554, tt0090967, 1554/tt0090967),
+    - If TMDB/IMDB ID is passed (e.g., 81, tt0087544, 81/tt0087544),
       finds the movie in the database, detects dood/playmogo embed, and extracts stream.
     - If direct URL or file ID is passed, extracts stream directly.
     """
