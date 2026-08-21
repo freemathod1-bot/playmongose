@@ -1,12 +1,11 @@
 """
 Render-ready FastAPI Web Service for DoodStream / Playmogo Extraction & ID Lookup.
 
-Endpoints:
-  - GET /
-  - GET /health
-  - GET /api/{query_id}          (Accepts TMDB ID e.g. 81, IMDB ID e.g. tt0087544, TMDB/IMDB combo e.g. 81/tt0087544, or direct Dood URL/ID)
-  - GET /api/extract?url=...     (Direct extraction by URL or Dood file code)
-  - GET /api/lookup/{query_id}   (Lookup database record only without extracting)
+Includes:
+  - Automatic Public & Residential Proxy Pool Fetching & Auto-Rotation (Bypasses Render/Datacenter IP blocks)
+  - Custom PROXY / RESIDENTIAL_PROXY environment variable support
+  - Cloudscraper + Browser-Fingerprinted Session fallback
+  - Fast O(1) TMDB/IMDB Indexed In-Memory Lookup
 """
 
 from __future__ import annotations
@@ -17,8 +16,9 @@ import os
 import random
 import re
 import string
+import threading
 import time
-from typing import Dict, Iterable, Optional, Tuple, Any
+from typing import Dict, Iterable, List, Optional, Tuple, Any
 from urllib.parse import urlparse
 
 import requests
@@ -37,8 +37,8 @@ logger = logging.getLogger("dood_api")
 
 app = FastAPI(
     title="DoodStream Video Extractor API",
-    description="FastAPI service for looking up movies by TMDB/IMDB and extracting direct stream links.",
-    version="1.0.0",
+    description="FastAPI service for looking up movies by TMDB/IMDB and extracting direct stream links with residential/public proxy rotation.",
+    version="1.1.0",
 )
 
 # Enable CORS for browser access
@@ -98,12 +98,69 @@ BROWSER_HEADERS = {
 }
 
 # ---------------------------------------------------------------------------
+# Proxy Management & Background Fetching
+# ---------------------------------------------------------------------------
+
+CUSTOM_PROXY = os.getenv("CUSTOM_PROXY", os.getenv("PROXY", "")).strip()
+
+PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=all&anonymity=all",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+]
+
+cached_proxies: List[str] = []
+last_proxy_fetch = 0
+
+
+def fetch_free_proxies():
+    """Fetch live public proxies from multi-source repositories."""
+    global cached_proxies, last_proxy_fetch
+    now = time.time()
+    if cached_proxies and (now - last_proxy_fetch < 900):  # Refresh every 15 min
+        return
+
+    collected = set()
+    # Add custom proxy if set in Render Environment Variables
+    if CUSTOM_PROXY:
+        collected.add(CUSTOM_PROXY)
+
+    for src in PROXY_SOURCES:
+        try:
+            r = requests.get(src, timeout=4)
+            if r.status_code == 200:
+                for line in r.text.splitlines():
+                    line = line.strip()
+                    if line and ":" in line and not line.startswith("#"):
+                        if not line.startswith("http"):
+                            line = f"http://{line}"
+                        collected.add(line)
+        except Exception:
+            continue
+
+    if collected:
+        cached_proxies = list(collected)
+        random.shuffle(cached_proxies)
+        last_proxy_fetch = now
+        logger.info(f"Loaded {len(cached_proxies)} proxies for auto-rotation.")
+
+
+def get_random_proxy() -> Optional[str]:
+    """Get a random proxy from the pool or custom proxy if provided."""
+    if CUSTOM_PROXY:
+        return CUSTOM_PROXY
+    if not cached_proxies:
+        fetch_free_proxies()
+    return random.choice(cached_proxies) if cached_proxies else None
+
+
+# ---------------------------------------------------------------------------
 # Database In-Memory Cache & Indexing
 # ---------------------------------------------------------------------------
 
 DATABASE_FILE = os.getenv("DATABASE_FILE", "merged_movie_streaming_data.json")
 
-# In-memory indexes for O(1) lookup
 tmdb_index: Dict[str, dict] = {}
 imdb_index: Dict[str, dict] = {}
 combo_index: Dict[str, dict] = {}
@@ -161,6 +218,7 @@ def load_database():
 @app.on_event("startup")
 def startup_event():
     load_database()
+    threading.Thread(target=fetch_free_proxies, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -178,14 +236,17 @@ def _make_play(token: str) -> str:
     return f"{rnd}?token={token}&expiry={int(time.time() * 1000)}"
 
 
-def _build_session(engine: str):
+def _build_session(engine: str, proxy_url: Optional[str] = None):
     if engine == "cloudscraper" and cloudscraper is not None:
         s = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
         )
     else:
         s = requests.Session()
+
     s.headers.update(BROWSER_HEADERS)
+    if proxy_url:
+        s.proxies = {"http": proxy_url, "https": proxy_url}
     return s
 
 
@@ -204,13 +265,14 @@ def _try_mirror(session, mirror: str, vid: str) -> Optional[Tuple[str, str]]:
 
 def _load_player(vid: str, mirrors: Iterable[str]) -> Tuple[Any, str, str]:
     """
-    Tries Cloudscraper first because Cloudflare blocks standard requests on cloud hosting (like Render/AWS).
-    Falls back to requests if needed.
+    Tries:
+    1. Direct Cloudscraper & Requests with top mirrors
+    2. If datacenter IP is blocked (Cloudflare 403), rotates residential & public proxy pool
     """
-    engines = ["cloudscraper", "requests"] if cloudscraper is not None else ["requests"]
     last_err = None
 
-    for engine in engines:
+    # Step 1: Direct attempt
+    for engine in (["cloudscraper", "requests"] if cloudscraper is not None else ["requests"]):
         session = _build_session(engine)
         for m in mirrors:
             hit = _try_mirror(session, m, vid)
@@ -218,6 +280,23 @@ def _load_player(vid: str, mirrors: Iterable[str]) -> Tuple[Any, str, str]:
                 final_url, html = hit
                 return session, final_url, html
             last_err = m
+
+    # Step 2: Proxy fallback attempt for blocked cloud/datacenter IPs
+    if not cached_proxies:
+        fetch_free_proxies()
+
+    proxy_sample = cached_proxies[:30] if cached_proxies else []
+    for proxy in proxy_sample:
+        for engine in (["cloudscraper", "requests"] if cloudscraper is not None else ["requests"]):
+            try:
+                session = _build_session(engine, proxy_url=proxy)
+                for m in mirrors[:4]:  # test top 4 mirrors with proxy
+                    hit = _try_mirror(session, m, vid)
+                    if hit:
+                        final_url, html = hit
+                        return session, final_url, html
+            except Exception:
+                continue
 
     raise RuntimeError(
         f"No mirror served the player for id={vid!r}. Last tried: {last_err}."
@@ -312,6 +391,7 @@ def index():
         "status": "online",
         "service": "DoodStream API Extractor",
         "total_indexed_movies": all_items_count,
+        "total_active_proxies": len(cached_proxies),
         "examples": [
             "/api/81",
             "/api/tt0087544",
@@ -324,7 +404,11 @@ def index():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "database_loaded": all_items_count > 0}
+    return {
+        "status": "healthy",
+        "database_loaded": all_items_count > 0,
+        "proxies_available": len(cached_proxies)
+    }
 
 
 @app.get("/api/lookup/{query_id:path}")
