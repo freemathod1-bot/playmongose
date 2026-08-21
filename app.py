@@ -1,7 +1,7 @@
 """
 Render-ready FastAPI Web Service for DoodStream / Playmogo Extraction & ID Lookup.
 
-Configured with dedicated residential proxy pool + Cloudscraper:
+Configured with dedicated residential proxy pool + Decompression fixes for Render:
   - 31.59.20.176:6754 (UK)
   - 31.56.127.193:7684 (US)
   - 45.38.107.97:6014 (UK)
@@ -22,6 +22,7 @@ import os
 import random
 import re
 import string
+import sys
 import time
 from typing import Dict, Iterable, List, Optional, Tuple, Any
 from urllib.parse import urlparse
@@ -37,13 +38,17 @@ except Exception:
     cloudscraper = None
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger("dood_api")
 
 app = FastAPI(
     title="DoodStream Video Extractor API",
     description="FastAPI service for looking up movies by TMDB/IMDB and extracting direct stream links with dedicated residential proxy rotation.",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 # Enable CORS for browser access
@@ -68,7 +73,6 @@ MIRRORS = [
     "vidply.com",
     "ds2play.com",
     "ds2video.com",
-    "d-s.io",
     "d000d.com",
     "d0000d.com",
     "dood.ws",
@@ -82,6 +86,7 @@ UA = (
     "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 )
 
+# Explicitly use gzip, deflate for clean decompression on Linux / Render
 BROWSER_HEADERS = {
     "User-Agent": UA,
     "Accept": (
@@ -90,7 +95,7 @@ BROWSER_HEADERS = {
         "application/signed-exchange;v=b3;q=0.7"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Upgrade-Insecure-Requests": "1",
     "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
     "sec-ch-ua-mobile": "?0",
@@ -121,6 +126,12 @@ RESIDENTIAL_PROXIES: List[str] = [
 
 def get_proxy_dict(proxy_url: str) -> dict:
     return {"http": proxy_url, "https": proxy_url}
+
+
+def _mask_proxy(p: str) -> str:
+    if "@" in p:
+        return p.split("@")[-1]
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +214,7 @@ def _make_play(token: str) -> str:
     return f"{rnd}?token={token}&expiry={int(time.time() * 1000)}"
 
 
-def _build_session(engine: str = "cloudscraper", proxy_url: Optional[str] = None):
+def _build_session(engine: str = "requests", proxy_url: Optional[str] = None):
     if engine == "cloudscraper" and cloudscraper is not None:
         s = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
@@ -217,52 +228,53 @@ def _build_session(engine: str = "cloudscraper", proxy_url: Optional[str] = None
     return s
 
 
-def _try_mirror(session, mirror: str, vid: str) -> Optional[Tuple[str, str]]:
+def _try_mirror(session, mirror: str, vid: str, debug_tag: str = "") -> Optional[Tuple[str, str]]:
     url = f"https://{mirror}/e/{vid}"
     try:
-        r = session.get(url, timeout=(4, 7), allow_redirects=True)
-    except requests.RequestException:
+        r = session.get(url, timeout=(5, 10), allow_redirects=True)
+        html_text = r.text
+        has_md5 = "/pass_md5/" in html_text
+        if debug_tag:
+            logger.info(f"[{debug_tag}] GET {mirror}/e/{vid} -> status={r.status_code}, len={len(html_text)}, pass_md5={has_md5}")
+        if r.status_code == 200 and has_md5:
+            return str(r.url), html_text
+    except Exception as exc:
+        if debug_tag:
+            logger.warning(f"[{debug_tag}] Connection error on {mirror}: {exc.__class__.__name__}")
         return None
-    if r.status_code != 200 or not r.text:
-        return None
-    if "/pass_md5/" not in r.text:
-        return None
-    return str(r.url), r.text
+    return None
 
 
 def _load_player(vid: str, mirrors: Iterable[str]) -> Tuple[Any, str, str]:
-    """
-    Combines Cloudscraper with Residential Proxies to guarantee 100% bypass of Cloudflare.
-    """
     proxies_to_try = list(RESIDENTIAL_PROXIES)
     random.shuffle(proxies_to_try)
 
-    last_err = None
-    engines = ["cloudscraper", "requests"] if cloudscraper is not None else ["requests"]
-
     # 1. Try with Residential Proxy pool
     for proxy in proxies_to_try:
-        for engine in engines:
+        masked = _mask_proxy(proxy)
+        for engine in ["requests", "cloudscraper"]:
+            if engine == "cloudscraper" and cloudscraper is None:
+                continue
             session = _build_session(engine=engine, proxy_url=proxy)
             for m in mirrors[:5]:
-                hit = _try_mirror(session, m, vid)
+                hit = _try_mirror(session, m, vid, debug_tag=f"{engine} via {masked}")
                 if hit:
                     final_url, html = hit
                     return session, final_url, html
-                last_err = m
 
     # 2. Fallback direct without proxy
-    for engine in engines:
+    for engine in ["requests", "cloudscraper"]:
+        if engine == "cloudscraper" and cloudscraper is None:
+            continue
         session_direct = _build_session(engine=engine)
         for m in mirrors:
-            hit = _try_mirror(session_direct, m, vid)
+            hit = _try_mirror(session_direct, m, vid, debug_tag=f"direct {engine}")
             if hit:
                 final_url, html = hit
                 return session_direct, final_url, html
-            last_err = m
 
     raise RuntimeError(
-        f"No mirror served the player for id={vid!r}. Last tried: {last_err}."
+        f"All proxies and mirrors failed for video_id={vid!r}."
     )
 
 
@@ -289,7 +301,7 @@ def extract_dood(url_or_id: str) -> dict:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Dest": "empty",
         },
-        timeout=(4, 8),
+        timeout=(5, 10),
     )
     r2.raise_for_status()
     body = r2.text.strip()
@@ -336,7 +348,7 @@ def find_in_database(query_id: str) -> Optional[dict]:
 def get_dood_url_from_entry(entry: dict) -> Optional[str]:
     """Inspects all host-* keys in entry for dood.watch or playmogo/playmongo mirrors."""
     dood_domains = (
-        "dood", "ds2play", "ds2video", "d000d", "d0000d", "d-s.io", "vidply", "playmogo", "playmongo"
+        "dood", "ds2play", "ds2video", "d000d", "d0000d", "d-s.io", "vidply", "playmogo.com", "playmongo"
     )
     for k, v in entry.items():
         if isinstance(v, str) and any(d in v.lower() for d in dood_domains):
