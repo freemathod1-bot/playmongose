@@ -1,17 +1,12 @@
 """
-Render-ready FastAPI Web Service for DoodStream / Playmogo Extraction & ID Lookup.
+FastAPI Web Service for DoodStream / Playmogo Extraction & ID Lookup (Direct / No Proxies).
 
-Configured with dedicated residential proxy pool + Decompression fixes for Render:
-  - 31.59.20.176:6754 (UK)
-  - 31.56.127.193:7684 (US)
-  - 45.38.107.97:6014 (UK)
-  - 198.105.121.200:6462 (UK)
-  - 64.137.96.74:6641 (ES)
-  - 198.23.243.226:6361 (US)
-  - 38.154.185.97:6370 (US)
-  - 84.247.60.125:6095 (PL)
-  - 142.111.67.146:5611 (JP)
-  - 191.96.254.138:6185 (US)
+Endpoints:
+  - GET /
+  - GET /health
+  - GET /api/{query_id}          (Accepts TMDB ID e.g. 81, IMDB ID e.g. tt0087544, TMDB/IMDB combo e.g. 81/tt0087544, or direct Dood URL/ID)
+  - GET /api/extract?url=...     (Direct extraction by URL or Dood file code)
+  - GET /api/lookup/{query_id}   (Lookup database record only without extracting)
 """
 
 from __future__ import annotations
@@ -24,7 +19,7 @@ import re
 import string
 import sys
 import time
-from typing import Dict, Iterable, List, Optional, Tuple, Any
+from typing import Dict, Iterable, Optional, Tuple, Any
 from urllib.parse import urlparse
 
 import requests
@@ -43,12 +38,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("dood_api")
+logger = logging.getLogger("dood_direct_api")
 
 app = FastAPI(
-    title="DoodStream Video Extractor API",
-    description="FastAPI service for looking up movies by TMDB/IMDB and extracting direct stream links with dedicated residential proxy rotation.",
-    version="1.3.0",
+    title="DoodStream Video Extractor API (No Proxies)",
+    description="Direct extraction service for looking up movies by TMDB/IMDB without any proxy overhead.",
+    version="1.0.0",
 )
 
 # Enable CORS for browser access
@@ -86,7 +81,6 @@ UA = (
     "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 )
 
-# Explicitly use gzip, deflate for clean decompression on Linux / Render
 BROWSER_HEADERS = {
     "User-Agent": UA,
     "Accept": (
@@ -106,33 +100,6 @@ BROWSER_HEADERS = {
     "Sec-Fetch-Dest": "document",
     "DNT": "1",
 }
-
-# ---------------------------------------------------------------------------
-# Dedicated Residential Proxy Pool
-# ---------------------------------------------------------------------------
-
-RESIDENTIAL_PROXIES: List[str] = [
-    "http://viqhajod:aisg6z1gsn25@31.59.20.176:6754",
-    "http://viqhajod:aisg6z1gsn25@31.56.127.193:7684",
-    "http://viqhajod:aisg6z1gsn25@45.38.107.97:6014",
-    "http://viqhajod:aisg6z1gsn25@198.105.121.200:6462",
-    "http://viqhajod:aisg6z1gsn25@64.137.96.74:6641",
-    "http://viqhajod:aisg6z1gsn25@198.23.243.226:6361",
-    "http://viqhajod:aisg6z1gsn25@38.154.185.97:6370",
-    "http://viqhajod:aisg6z1gsn25@84.247.60.125:6095",
-    "http://viqhajod:aisg6z1gsn25@142.111.67.146:5611",
-    "http://viqhajod:aisg6z1gsn25@191.96.254.138:6185",
-]
-
-def get_proxy_dict(proxy_url: str) -> dict:
-    return {"http": proxy_url, "https": proxy_url}
-
-
-def _mask_proxy(p: str) -> str:
-    if "@" in p:
-        return p.split("@")[-1]
-    return p
-
 
 # ---------------------------------------------------------------------------
 # Database In-Memory Cache & Indexing
@@ -200,7 +167,7 @@ def startup_event():
 
 
 # ---------------------------------------------------------------------------
-# Extractor Logic
+# Direct Extractor Logic (No Proxies)
 # ---------------------------------------------------------------------------
 
 def _video_id(s: str) -> str:
@@ -214,7 +181,7 @@ def _make_play(token: str) -> str:
     return f"{rnd}?token={token}&expiry={int(time.time() * 1000)}"
 
 
-def _build_session(engine: str = "requests", proxy_url: Optional[str] = None):
+def _build_session(engine: str = "cloudscraper"):
     if engine == "cloudscraper" and cloudscraper is not None:
         s = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
@@ -223,58 +190,35 @@ def _build_session(engine: str = "requests", proxy_url: Optional[str] = None):
         s = requests.Session()
 
     s.headers.update(BROWSER_HEADERS)
-    if proxy_url:
-        s.proxies = get_proxy_dict(proxy_url)
     return s
 
 
-def _try_mirror(session, mirror: str, vid: str, debug_tag: str = "") -> Optional[Tuple[str, str]]:
+def _try_mirror(session, mirror: str, vid: str) -> Optional[Tuple[str, str]]:
     url = f"https://{mirror}/e/{vid}"
     try:
-        r = session.get(url, timeout=(5, 10), allow_redirects=True)
-        html_text = r.text
-        has_md5 = "/pass_md5/" in html_text
-        if debug_tag:
-            logger.info(f"[{debug_tag}] GET {mirror}/e/{vid} -> status={r.status_code}, len={len(html_text)}, pass_md5={has_md5}")
-        if r.status_code == 200 and has_md5:
-            return str(r.url), html_text
-    except Exception as exc:
-        if debug_tag:
-            logger.warning(f"[{debug_tag}] Connection error on {mirror}: {exc.__class__.__name__}")
+        r = session.get(url, timeout=(4, 7), allow_redirects=True)
+        if r.status_code == 200 and "/pass_md5/" in r.text:
+            return str(r.url), r.text
+    except requests.RequestException:
         return None
     return None
 
 
 def _load_player(vid: str, mirrors: Iterable[str]) -> Tuple[Any, str, str]:
-    proxies_to_try = list(RESIDENTIAL_PROXIES)
-    random.shuffle(proxies_to_try)
+    last_err = None
+    engines = ["cloudscraper", "requests"] if cloudscraper is not None else ["requests"]
 
-    # 1. Try with Residential Proxy pool
-    for proxy in proxies_to_try:
-        masked = _mask_proxy(proxy)
-        for engine in ["requests", "cloudscraper"]:
-            if engine == "cloudscraper" and cloudscraper is None:
-                continue
-            session = _build_session(engine=engine, proxy_url=proxy)
-            for m in mirrors[:5]:
-                hit = _try_mirror(session, m, vid, debug_tag=f"{engine} via {masked}")
-                if hit:
-                    final_url, html = hit
-                    return session, final_url, html
-
-    # 2. Fallback direct without proxy
-    for engine in ["requests", "cloudscraper"]:
-        if engine == "cloudscraper" and cloudscraper is None:
-            continue
-        session_direct = _build_session(engine=engine)
+    for engine in engines:
+        session = _build_session(engine=engine)
         for m in mirrors:
-            hit = _try_mirror(session_direct, m, vid, debug_tag=f"direct {engine}")
+            hit = _try_mirror(session, m, vid)
             if hit:
                 final_url, html = hit
-                return session_direct, final_url, html
+                return session, final_url, html
+            last_err = m
 
     raise RuntimeError(
-        f"All proxies and mirrors failed for video_id={vid!r}."
+        f"No mirror served the player for id={vid!r}. Last tried: {last_err}."
     )
 
 
@@ -301,7 +245,7 @@ def extract_dood(url_or_id: str) -> dict:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Dest": "empty",
         },
-        timeout=(5, 10),
+        timeout=(4, 8),
     )
     r2.raise_for_status()
     body = r2.text.strip()
@@ -364,9 +308,9 @@ def get_dood_url_from_entry(entry: dict) -> Optional[str]:
 def index():
     return {
         "status": "online",
-        "service": "DoodStream API Extractor",
+        "service": "DoodStream Direct API Extractor (No Proxies)",
         "total_indexed_movies": all_items_count,
-        "residential_proxies_configured": len(RESIDENTIAL_PROXIES),
+        "mode": "direct_connection",
         "examples": [
             "/api/81",
             "/api/tt0087544",
@@ -379,11 +323,7 @@ def index():
 
 @app.get("/health")
 def health():
-    return {
-        "status": "healthy",
-        "database_loaded": all_items_count > 0,
-        "proxies_count": len(RESIDENTIAL_PROXIES)
-    }
+    return {"status": "healthy", "database_loaded": all_items_count > 0}
 
 
 @app.get("/api/lookup/{query_id:path}")
@@ -418,7 +358,7 @@ def api_resolve(query_id: str):
     """
     Unified endpoint:
     - If TMDB/IMDB ID is passed (e.g., 81, tt0087544, 81/tt0087544),
-      finds the movie in the database, detects dood/playmogo embed, and extracts stream.
+      finds the movie in the database, detects dood/playmogo embed, and extracts stream directly.
     - If direct URL or file ID is passed, extracts stream directly.
     """
     clean_query = query_id.strip()
@@ -478,4 +418,4 @@ def api_resolve(query_id: str):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("app_direct:app", host="0.0.0.0", port=port, reload=True)
